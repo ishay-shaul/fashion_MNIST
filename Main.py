@@ -38,6 +38,7 @@ class Autoencoder(nn.Module):
         decoded = self.decoder(encoded)
         return decoded
 
+
 def autoencoder_oracle(model, criterion, x, calc_fisher=False):
     """
     Computes loss and Fisher Information diagonal.
@@ -59,12 +60,13 @@ def autoencoder_oracle(model, criterion, x, calc_fisher=False):
 
     return loss, grads, fisher_diagonals
 
+
 print("Initializing the model (Defining the function surface)...")
 train_dataset = TensorDataset(x_train)
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 
 # This dataset is for the second order learners - so you wont run out of RAM
-small_train_dataset = TensorDataset(x_train[:100]) # רק 100 תמונות להדגמה
+small_train_dataset = TensorDataset(x_train[:100])  # רק 100 תמונות להדגמה
 small_train_loader = DataLoader(small_train_dataset, batch_size=10, shuffle=True)
 
 
@@ -82,13 +84,15 @@ def gd_step(x, grad_f_x, acc, learning_rate=0.1, beta=0.9, weight_decay=1e-5):
 
     return x_new, new_acc
 
+
 import torch.nn as nn
+
 
 def newton_step(param_obj, grad_f_x, fisher_diag, step_count, learning_rate=0.001):
     global _ADAHESSIAN_STATES
     param_key = param_obj  # Use the Parameter object itself as the key
 
-    x = param_obj.data # Get the underlying tensor data
+    x = param_obj.data  # Get the underlying tensor data
 
     # Hyperparameters
     beta1, beta2 = 0.9, 0.999
@@ -145,69 +149,79 @@ def newton_step(param_obj, grad_f_x, fisher_diag, step_count, learning_rate=0.00
 
     return x - learning_rate * update
 
-def run_model_optimization_experiment(
-            self,
-            optimizer_type: str,
-            model: nn.Module,
-            criterion: nn.Module,
-            train_loader: DataLoader,
-            epochs: int,
-            learning_rate: float
-    ):
+
+import numpy as np
+import time
+
+
+def run_model_optimization_experiment(optimizer_type, model, criterion, train_loader, epochs, learning_rate):
     """
-    Runs an optimization experiment to train the MODEL using GD or Newton.
-    Closer to the requested structure.
+    Runs optimization using Fisher Information (Natural Gradient approximation).
+    Recommended initial learning_rate: 0.2
     """
     all_losses = []
     print(f"\nStarting MODEL {optimizer_type.upper()} optimization for {epochs} epochs (lr={learning_rate})...")
     total_start_time = time.time()
 
+    global _ADAHESSIAN_STATES
+    _ADAHESSIAN_STATES = {}  # Clear the global state for each new experiment run
+
+    # Initialize momentum for GD if applicable (re-init for each experiment)
+    cur_acc_list = [torch.zeros_like(p) for p in model.parameters()]
+    global_step = 1
+    total_steps = epochs * len(train_loader)
+
     for epoch in range(epochs):
         epoch_loss = 0
-
         for batch_idx, batch in enumerate(train_loader):
             img = batch[0]
 
-            calc_hessian_for_oracle = (optimizer_type == 'newton')
-            loss, grads, hessians = self.autoencoder_oracle(model, criterion, img, calc_hessian=calc_hessian_for_oracle)
-
+            # --- FISHER ORACLE CALL ---
+            # Using calc_fisher instead of calc_hessian for the Newton path
+            calc_fisher = (optimizer_type == 'newton')
+            loss, grads, fishers = autoencoder_oracle(model, criterion, img, calc_fisher=calc_fisher)
             epoch_loss += loss.item()
 
-            # 2. Optimization step
+            # --- DYNAMIC LEARNING RATE (Cosine Annealing) ---
+            cur_lr = learning_rate * 0.5 * (1 + np.cos(np.pi * global_step / total_steps))
+
+            # --- DYNAMIC MOMENTUM (BETA) ---
+            if global_step / total_steps < 0.5:
+                beta = 0.9
+            else:
+                beta = 0.9 + 0.08 * ((global_step / total_steps - 0.5) * 2)
+
             with torch.no_grad():
                 if optimizer_type == 'gd':
-                    for param, grad in zip(model.parameters(), grads):
-                        param.data = self.gd_step(param.data, grad, learning_rate)
+                    for i, (param, grad) in enumerate(zip(model.parameters(), grads)):
+                        new_val, new_acc = gd_step(param.data, grad, cur_acc_list[i], cur_lr, beta)
+                        param.data = new_val
+                        cur_acc_list[i] = new_acc
 
                 elif optimizer_type == 'newton':
-                    if hessians is None:
-                        raise ValueError("Hessian missing for Newton method")
-                    for param, grad, hessian in zip(model.parameters(), grads, hessians):
-                        param.data = self.newton_step(param.data, grad, hessian, learning_rate)
+                    # Fisher-based adaptive step
+                    for param, grad, fisher in zip(model.parameters(), grads, fishers):
+                        # Pass the Parameter object itself and the correct global_step
+                        param.data = newton_step(param, grad, fisher, global_step, cur_lr)
 
-                else:
-                    raise ValueError("Invalid optimizer type")
+            global_step += 1
 
         avg_loss = epoch_loss / len(train_loader)
         all_losses.append(avg_loss)
-
         if (epoch + 1) % (epochs // 5) == 0 or epoch == 0 or epoch == epochs - 1:
             print(f"  Epoch [{epoch + 1}/{epochs}] Loss: {avg_loss:.6f}")
 
-    total_end_time = time.time()
-    total_training_time = total_end_time - total_start_time
-    print(f"\nTotal Training Time: {total_training_time:.2f} seconds")
-    print(f"Finished {optimizer_type.upper()} optimization. Final Loss: {all_losses[-1]:.6f}")
+    print(f"\nTotal Training Time: {time.time() - total_start_time:.2f} seconds")
     return model, all_losses
 
 
 epochs = 20
-lr = 0.01
+lr = 1
 model = Autoencoder()
 criterion = nn.MSELoss()
 
 trained_model, losses = run_model_optimization_experiment(
-    'newton', model, criterion, train_loader, epochs, lr
+    'gd', model, criterion, train_loader, epochs, lr
 )
 
 plt.figure(figsize=(10, 6))
@@ -239,13 +253,13 @@ def show_model_reconstructions(model, batch_images, count=5):
         img_recon = reconstructions[i].cpu().numpy().reshape(28, 28)
 
         # Original
-        ax = plt.subplot(count, 2, i*2 + 1)
+        ax = plt.subplot(count, 2, i * 2 + 1)
         plt.imshow(img_orig, cmap='gray')
         if i == 0: ax.set_title("Original")
         plt.axis('off')
 
-        #Reconstructed
-        ax = plt.subplot(count, 2, i*2 + 2)
+        # Reconstructed
+        ax = plt.subplot(count, 2, i * 2 + 2)
         plt.imshow(img_recon, cmap='gray')
         if i == 0: ax.set_title("Reconstructed (Model Output)")
         plt.axis('off')
